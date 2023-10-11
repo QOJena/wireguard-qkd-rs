@@ -4,6 +4,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
+use super::super::wireguard::etsi_014::EndpointETSI;
+
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::udp::Owner;
@@ -26,6 +28,7 @@ pub struct PeerState {
     pub endpoint: Option<SocketAddr>,
     pub persistent_keepalive_interval: u64,
     pub preshared_key: [u8; 32], // 0^32 is the "default value" (though treated like any other psk)
+    pub etsi_endpoint: Option<EndpointETSI>,
 }
 
 pub struct WireGuardConfig<T: tun::Tun, B: udp::PlatformUDP>(Arc<Mutex<Inner<T, B>>>);
@@ -182,6 +185,20 @@ pub trait Configuration {
 
     fn get_listen_port(&self) -> Option<u16>;
 
+
+    /// Set a new kme-hostname to the peer
+    /// 
+    /// # Arguments
+    /// 
+    /// - `peer`: The public key of the peer
+    /// - `kme_hostname`: String representing the kme-hostname
+    /// 
+    /// # Returns
+    /// 
+    /// An error if the peer does not exists
+    
+    fn set_etsi_endpoint(&self, peer: &PublicKey, kme_hostname: String, kme_hostname: String);
+
     /// Returns the state of all peers
     ///
     /// # Returns
@@ -332,6 +349,24 @@ impl<T: tun::Tun, B: udp::PlatformUDP> Configuration for WireGuardConfig<T, B> {
         }
     }
 
+    fn set_etsi_endpoint(&self, peer: &PublicKey, kme_hostname: String, slave_sae: String) {
+        if let Some(peer) = self.lock().wireguard.peers.read().get(peer) {
+            peer.set_etsi_endpoint(EndpointETSI { KME_hostname: kme_hostname, slave_SAE_ID: slave_sae })
+        }
+    }
+
+    // fn set_kme_hostname(&self, peer: &PublicKey, kme_hostname: String) {
+    //     if let Some(peer) = self.lock().wireguard.peers.read().get(peer) {
+    //         peer.set_kme_hostname(kme_hostname);
+    //     }
+    // }
+
+    // fn set_slave_sae(&self, peer: &PublicKey, slave_sae: String) {
+    //     if let Some(peer) = self.lock().wireguard.peers.read().get(peer) {
+    //         peer.set_slave_sae(slave_sae);
+    //     }
+    // }
+
     /*
 
 
@@ -376,6 +411,7 @@ impl<T: tun::Tun, B: udp::PlatformUDP> Configuration for WireGuardConfig<T, B> {
                     allowed_ips: p.list_allowed_ips(),
                     last_handshake_time,
                     public_key: pk,
+                    etsi_endpoint: p.get_etsi_endpoint(),
                 })
             }
         }

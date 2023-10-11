@@ -16,6 +16,8 @@ use clear_on_drop::clear::Clear;
 use x25519_dalek::PublicKey;
 use x25519_dalek::StaticSecret;
 
+use crate::wireguard::etsi_014::EndpointETSI;
+
 use super::macs;
 use super::messages::{CookieReply, Initiation, Response};
 use super::messages::{TYPE_COOKIE_REPLY, TYPE_INITIATION, TYPE_RESPONSE};
@@ -278,17 +280,19 @@ impl<O> Device<O> {
     pub fn begin<R: RngCore + CryptoRng>(
         &self,
         rng: &mut R,
+        endpoint: EndpointETSI,
         pk: &PublicKey,
     ) -> Result<Vec<u8>, HandshakeError> {
         match (self.keyst.as_ref(), self.pk_map.get(pk.as_bytes())) {
             (_, None) => Err(HandshakeError::UnknownPublicKey),
             (None, _) => Err(HandshakeError::UnknownPublicKey),
             (Some(keyst), Some(peer)) => {
+
                 let local = self.allocate(rng, pk);
                 let mut msg = Initiation::default();
 
                 // create noise part of initation
-                noise::create_initiation(rng, keyst, peer, pk, local, &mut msg.noise)?;
+                noise::create_initiation(rng, keyst, peer, pk, local, endpoint,&mut msg.noise)?;
 
                 // add macs to initation
                 peer.macs
@@ -297,6 +301,63 @@ impl<O> Device<O> {
 
                 Ok(msg.as_bytes().to_owned())
             }
+        }
+    }
+
+    pub fn get_peer<'a, R: RngCore + CryptoRng>(
+        &'a self,
+        rng: &mut R,             // rng instance to sample randomness from
+        msg: &[u8],              // message buffer
+        src: Option<SocketAddr>, // optional source endpoint, set when "under load"
+    ) -> Result<Option<&'a O>, HandshakeError> {
+        // ensure type read in-range
+        if msg.len() < 4 {
+            return Err(HandshakeError::InvalidMessageFormat);
+        }
+
+        // obtain reference to key state
+        // if no key is configured return a noop.
+        let keyst = match self.keyst.as_ref() {
+            Some(key) => key,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        // de-multiplex the message type field
+        match LittleEndian::read_u32(msg) {
+            TYPE_INITIATION => {
+                // parse message
+                let msg = Initiation::parse(msg)?;
+
+                // consume the initiation (Get the public key)
+                let (peer, pk) = noise::get_peer_from_init(self, keyst, &msg.noise)?;                
+
+                // return unconfirmed keypair and the response as vector
+                Ok(Some(&peer.opaque))
+            }
+            TYPE_RESPONSE => {
+                let msg = Response::parse(msg)?;
+
+                // consume inner playload
+                let (peer, _) = self.lookup_id(msg.noise.f_receiver.get())?;
+
+                Ok(Some(&peer.opaque))
+            }
+            TYPE_COOKIE_REPLY => {
+                let msg = CookieReply::parse(msg)?;
+
+                // lookup peer
+                let (peer, _) = self.lookup_id(msg.f_receiver.get())?;
+
+                // validate cookie reply
+                peer.macs.lock().process(&msg)?;
+
+                // this prompts no new message and
+                // DOES NOT cryptographically verify the peer
+                Ok(Some(&peer.opaque))
+            }
+            _ => Err(HandshakeError::InvalidMessageFormat),
         }
     }
 
@@ -310,6 +371,7 @@ impl<O> Device<O> {
         rng: &mut R,             // rng instance to sample randomness from
         msg: &[u8],              // message buffer
         src: Option<SocketAddr>, // optional source endpoint, set when "under load"
+        endpoint: EndpointETSI,
     ) -> Result<Output<'a, O>, HandshakeError> {
         // ensure type read in-range
         if msg.len() < 4 {
@@ -336,7 +398,7 @@ impl<O> Device<O> {
 
                 // address validation & DoS mitigation
                 if let Some(src) = src {
-                    // check mac2 field
+                    // check mac2 fieldTYPE_INITIATION
                     if !keyst.macs.check_mac2(msg.noise.as_bytes(), &src, &msg.macs) {
                         let mut reply = Default::default();
                         keyst.macs.create_cookie_reply(
@@ -355,8 +417,9 @@ impl<O> Device<O> {
                     }
                 }
 
-                // consume the initiation
-                let (peer, pk, st) = noise::consume_initiation(self, keyst, &msg.noise)?;
+                // consume the initiation (Get the public key)
+                let (peer, pk, st) = noise::consume_initiation(self, keyst, &msg.noise, &endpoint)?;                
+                
 
                 // allocate new index for response
                 let local = self.allocate(rng, &pk);
@@ -365,7 +428,7 @@ impl<O> Device<O> {
                 let mut resp = Response::default();
 
                 // create response (release id on error)
-                let keys = noise::create_response(rng, peer, &pk, local, st, &mut resp.noise)
+                let keys = noise::create_response(rng, peer, &pk, local, st, &mut resp.noise, &endpoint)
                     .map_err(|e| {
                         self.release(local);
                         e
@@ -411,7 +474,7 @@ impl<O> Device<O> {
                 }
 
                 // consume inner playload
-                noise::consume_response(self, keyst, &msg.noise)
+                noise::consume_response(self, keyst, &msg.noise, &endpoint)
             }
             TYPE_COOKIE_REPLY => {
                 let msg = CookieReply::parse(msg)?;

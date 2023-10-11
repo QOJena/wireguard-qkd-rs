@@ -20,6 +20,8 @@ struct ParsedPeer {
     persistent_keepalive_interval: Option<u64>,
     protocol_version: Option<usize>,
     endpoint: Option<SocketAddr>,
+    kme_hostname: Option<String>,
+    slave_sae: Option<String>,
 }
 
 pub struct LineParser<'a, C: Configuration> {
@@ -47,6 +49,8 @@ impl<'a, C: Configuration> LineParser<'a, C> {
                 persistent_keepalive_interval: None,
                 protocol_version: None,
                 endpoint: None,
+                kme_hostname: None,
+                slave_sae: None,
             })),
             Err(_) => Err(ConfigError::InvalidHexValue),
         }
@@ -100,8 +104,13 @@ impl<'a, C: Configuration> LineParser<'a, C> {
                 config.set_endpoint(&peer.public_key, endpoint);
             };
 
+            if let (Some(kme_hostname), Some(slave_sae)) = (&peer.kme_hostname, &peer.slave_sae) {
+                log::trace!("flush peer, set kme hostname {}", kme_hostname);
+                config.set_etsi_endpoint(&peer.public_key, kme_hostname.clone(), slave_sae.clone());
+            }
+
             None
-        };
+        }
 
         // parse line and update parser state
         match self.state {
@@ -168,6 +177,11 @@ impl<'a, C: Configuration> LineParser<'a, C> {
                 // opt: new peer
                 "public_key" => {
                     flush_peer(self.config, &peer);
+                    log::debug!("Public key: {:?}", value);
+                    match <[u8; 32]>::from_hex(value) {
+                        Ok(sk) => log::debug!("Public Key with PK: {:?}", hex::encode(PublicKey::from(sk).as_bytes())),
+                        Err(err) => log::debug!("Error {:?}", err)
+                    }
                     self.state = Self::new_peer(value)?;
                     Ok(())
                 }
@@ -242,6 +256,17 @@ impl<'a, C: Configuration> LineParser<'a, C> {
                         }
                         Err(_) => Err(ConfigError::UnsupportedProtocolVersion),
                     }
+                }
+
+                // kme-hostname
+                "kme_hostname" => {
+                    peer.kme_hostname = Some(String::from(value));
+                    Ok(())
+                }
+
+                "slave_sae_id" => {
+                    peer.slave_sae = Some(String::from(value));
+                    Ok(())
                 }
 
                 // flush (used at end of transcipt)

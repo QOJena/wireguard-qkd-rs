@@ -50,6 +50,12 @@ pub fn serialize<C: Configuration, W: io::Write>(writer: &mut W, config: &C) -> 
         for (ip, cidr) in p.allowed_ips {
             write("allowed_ip", ip.to_string() + "/" + &cidr.to_string())?;
         }
+        
+        if let Some(endpoint) = p.etsi_endpoint {
+            write("kme_hostname", endpoint.KME_hostname)?;
+            write("slave_sae_id", endpoint.slave_SAE_ID)?;
+        }
+        
     }
 
     Ok(())

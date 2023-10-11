@@ -45,6 +45,7 @@ pub enum State {
         eph_sk: StaticSecret,
         hs: GenericArray<u8, U32>,
         ck: GenericArray<u8, U32>,
+        key: GenericArray<u8, U32>,
     },
 }
 

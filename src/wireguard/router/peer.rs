@@ -28,6 +28,8 @@ use std::net::{IpAddr, SocketAddr};
 use arraydeque::{ArrayDeque, Wrapping};
 use spin::Mutex;
 
+use super::super::etsi_014::EndpointETSI;
+
 pub struct KeyWheel {
     next: Option<Arc<KeyPair>>,     // next key state (unconfirmed)
     current: Option<Arc<KeyPair>>,  // current key state (used for encryption)
@@ -44,6 +46,7 @@ pub struct PeerInner<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E
     pub(super) keys: Mutex<KeyWheel>,
     pub(super) enc_key: Mutex<Option<EncryptionState>>,
     pub(super) endpoint: Mutex<Option<E>>,
+    pub(super) etsi_endpoint: Mutex<Option<EndpointETSI>>
 }
 
 /// A Peer dereferences to its opaque type:
@@ -205,6 +208,7 @@ pub fn new_peer<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>>(
                     retired: vec![],
                 }),
                 staged_packets: spin::Mutex::new(ArrayDeque::new()),
+                etsi_endpoint: spin::Mutex::new(None)
             }),
         }
     };
@@ -522,6 +526,15 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> PeerHandle<E,
             .table
             .insert(ip, masklen, self.peer.clone())
     }
+
+    pub fn set_etsi_endpoint(&self, etsi_endpoint: EndpointETSI) {
+        *self.peer.etsi_endpoint.lock() = Some(etsi_endpoint);
+    }
+
+    pub fn get_etsi_endpoint(&self) -> Option<EndpointETSI> {
+        self.peer.etsi_endpoint.lock().as_ref().map(|e| (*e).clone())
+    }
+
 
     /// List subnets mapped to the peer
     ///

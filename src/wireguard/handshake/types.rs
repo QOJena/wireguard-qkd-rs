@@ -46,6 +46,12 @@ pub enum HandshakeError {
     InvalidMac1,
     RateLimited,
     InitiationFlood,
+
+    // QKD Errors
+    // endpoint
+    NoKeyFound,
+    InvalidQKDFormat,
+    EndpointNotSet,
 }
 
 impl fmt::Display for HandshakeError {
@@ -65,6 +71,9 @@ impl fmt::Display for HandshakeError {
             HandshakeError::InitiationFlood => {
                 write!(f, "Message was dropped because of initiation flood")
             }
+            HandshakeError::NoKeyFound => write!(f, "No key found in the endpoint"),
+            HandshakeError::InvalidQKDFormat => write!(f, "Invalid format of either the key or the id"),
+            HandshakeError::EndpointNotSet => write!(f, "No endpoint set"),
         }
     }
 }

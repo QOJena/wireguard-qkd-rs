@@ -1,5 +1,8 @@
+use std::convert::TryInto;
 use std::time::Instant;
 
+use base64::Engine;
+use base64::engine::general_purpose;
 // DH
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
@@ -21,6 +24,8 @@ use clear_on_drop::clear_stack_on_return_fnonce;
 
 use subtle::ConstantTimeEq;
 
+use crate::wireguard::etsi_014::{EndpointETSI, KeyIdRequest, KeyId, KeyRequest};
+
 use super::device::{Device, KeyState};
 use super::messages::{NoiseInitiation, NoiseResponse};
 use super::messages::{TYPE_INITIATION, TYPE_RESPONSE};
@@ -36,7 +41,7 @@ type HMACBlake2s = Hmac<Blake2s>;
 
 // convenient alias to pass state temporarily into device.rs and back
 
-type TemporaryState = (u32, PublicKey, GenericArray<u8, U32>, GenericArray<u8, U32>);
+type TemporaryState = (u32, PublicKey, GenericArray<u8, U32>, GenericArray<u8, U32>, GenericArray<u8, U32>);
 
 const SIZE_CK: usize = 32;
 const SIZE_HS: usize = 32;
@@ -212,6 +217,98 @@ mod tests {
     }
 }
 
+const SIZE_UUID: usize = 16;
+const SIZE_KEY: usize = 32;
+
+pub struct QKDKeyPair {
+    pub id: [u8; SIZE_UUID],
+    pub key: [u8; SIZE_KEY]
+}
+
+impl QKDKeyPair {
+
+    pub fn parse(id: String, key: String) -> Result<QKDKeyPair, HandshakeError> {
+        match (QKDKeyPair::parse_id(id), QKDKeyPair::parse_key(key)) {
+            (Ok(id), Ok(key)) => Ok(QKDKeyPair{id: id, key: key}),
+            (_, _) => Err(HandshakeError::DecryptionFailure)
+        }
+        
+    }
+
+
+    pub fn parse_id(id: String) -> Result<[u8; SIZE_UUID], HandshakeError> {
+        let id = match uuid::Uuid::parse_str(&id) {
+            Ok(id) => Ok(*id.as_bytes()),
+            Err(err) => Err(HandshakeError::InvalidQKDFormat)
+        }; 
+
+        id
+    }
+
+    pub fn parse_key(key: String) -> Result<[u8; SIZE_KEY], HandshakeError> {
+        let key_result  = match general_purpose::STANDARD.decode(key) {
+            Ok(key) => key,
+            Err(err) => return Err(HandshakeError::InvalidQKDFormat)
+        };
+
+        let key_result: [u8; SIZE_KEY] = match key_result.try_into() {
+            Ok(key) => key,
+            Err(err) => return Err(HandshakeError::InvalidQKDFormat)
+        };
+        
+        Ok(key_result)
+    }
+}
+
+
+
+fn get_key(endpoint: &EndpointETSI) -> Result<QKDKeyPair, HandshakeError>  {
+    // Get a key
+    let keys = match endpoint.get_key(Some(&KeyRequest {
+        number: Some(1),
+        size: Some(256),
+        additional_slave_SAE_IDs: None,
+    })) {
+        Ok(key) => key,
+        Err(err) => {
+            log::debug!("Error get key: {:?}", err);
+            return Err(HandshakeError::NoKeyFound)
+        }
+    };
+
+    if keys.keys.is_empty() {
+        Err(HandshakeError::DecryptionFailure)
+    } else {
+        log::debug!("Key id: {:?}", keys.keys[0].key_ID);
+        QKDKeyPair::parse(keys.keys[0].key_ID.clone(), keys.keys[0].key.clone())
+    }
+
+
+}
+
+fn get_key_id(endpoint: &EndpointETSI, id: [u8; 16]) -> Result<QKDKeyPair, HandshakeError>  {
+
+    log::debug!("Key id: {:?}", uuid::Uuid::from_bytes(id).to_string());
+    let keys = match endpoint.get_key_with_id(&KeyIdRequest {
+        key_IDs: vec![KeyId { key_ID: uuid::Uuid::from_bytes(id).to_string() }],
+    }) {
+        Ok(key) => key,
+        Err(err) => {
+            log::debug!("Get key: {:?}", err);
+             return Err(HandshakeError::NoKeyFound)
+        }
+    };
+
+    
+
+    if keys.keys.is_empty() {
+        Err(HandshakeError::NoKeyFound)
+    } else {
+        log::debug!("Key id: {:?}", keys.keys[0].key_ID);
+        QKDKeyPair::parse(keys.keys[0].key_ID.clone(), keys.keys[0].key.clone())
+    }
+}
+
 // Computes an X25519 shared secret.
 //
 // This function wraps dalek to add a zero-check.
@@ -233,6 +330,7 @@ pub(super) fn create_initiation<R: RngCore + CryptoRng, O>(
     peer: &Peer<O>,
     pk: &PublicKey,
     local: u32,
+    endpoint: EndpointETSI,
     msg: &mut NoiseInitiation,
 ) -> Result<(), HandshakeError> {
     log::debug!("create initiation");
@@ -251,6 +349,15 @@ pub(super) fn create_initiation<R: RngCore + CryptoRng, O>(
 
         msg.f_type.set(TYPE_INITIATION as u32);
         msg.f_sender.set(local); // from us
+
+        // Get key
+        let keypair = get_key(&endpoint)?;
+
+
+        // Get a copy for the message
+        msg.f_id = keypair.id.clone();
+
+        log::debug!("create init {:?}", msg.f_id);
 
         // (E_priv, E_pub) := DH-Generate()
 
@@ -305,14 +412,65 @@ pub(super) fn create_initiation<R: RngCore + CryptoRng, O>(
 
         // update state of peer
 
+        let key: GenericArray<u8, U32> = keypair.key.into();
+
         *peer.state.lock() = State::InitiationSent {
             hs,
             ck,
             eph_sk,
             local,
+            key
         };
 
         Ok(())
+    })
+}
+
+pub(super) fn get_peer_from_init<'a, O>(
+    device: &'a Device<O>,
+    keyst: &KeyState,
+    msg: &NoiseInitiation,
+) -> Result<(&'a Peer<O>, PublicKey), HandshakeError> {
+    log::debug!("consume initiation");
+
+    clear_stack_on_return_fnonce(CLEAR_PAGES, || {
+        // initialize new state
+
+        let ck = INITIAL_CK;
+        let hs = INITIAL_HS;
+        let hs = HASH!(&hs, keyst.pk.as_bytes());
+
+        // C := Kdf(C, E_pub)
+
+        let ck = KDF1!(&ck, &msg.f_ephemeral);
+
+        // H := HASH(H, msg.ephemeral)
+
+        let hs = HASH!(&hs, &msg.f_ephemeral);
+
+        // (C, k) := Kdf2(C, DH(E_priv, S_pub))
+
+        let eph_r_pk = PublicKey::from(msg.f_ephemeral);
+        let (ck, key) = KDF2!(&ck, shared_secret(&keyst.sk, &eph_r_pk)?.as_bytes());
+
+        // msg.static := Aead(k, 0, S_pub, H)
+
+        let mut pk = [0u8; 32];
+
+        OPEN!(
+            &key,
+            &hs,           // ad
+            &mut pk,       // pt
+            &msg.f_static  // ct || tag
+        )?;
+
+        let peer = device.lookup_pk(&PublicKey::from(pk))?;
+
+        // check for zero shared-secret (see "shared_secret" note).
+        Ok((
+            peer,
+            PublicKey::from(pk)
+        ))
     })
 }
 
@@ -320,6 +478,7 @@ pub(super) fn consume_initiation<'a, O>(
     device: &'a Device<O>,
     keyst: &KeyState,
     msg: &NoiseInitiation,
+    endpoint: &EndpointETSI,
 ) -> Result<(&'a Peer<O>, PublicKey, TemporaryState), HandshakeError> {
     log::debug!("consume initiation");
 
@@ -393,12 +552,14 @@ pub(super) fn consume_initiation<'a, O>(
 
         let hs = HASH!(&hs, &msg.f_timestamp);
 
+
         // return state (to create response)
+        let key = get_key_id(&endpoint, msg.f_id)?;
 
         Ok((
             peer,
             PublicKey::from(pk),
-            (msg.f_sender.get(), eph_r_pk, hs, ck),
+            (msg.f_sender.get(), eph_r_pk, hs, ck, key.key.into()),
         ))
     })
 }
@@ -410,12 +571,13 @@ pub(super) fn create_response<R: RngCore + CryptoRng, O>(
     local: u32,              // sending identifier
     state: TemporaryState,   // state from "consume_initiation"
     msg: &mut NoiseResponse, // resulting response
+    endpoint: &EndpointETSI,
 ) -> Result<KeyPair, HandshakeError> {
     log::debug!("create response");
     clear_stack_on_return_fnonce(CLEAR_PAGES, || {
         // unpack state
 
-        let (receiver, eph_r_pk, hs, ck) = state;
+        let (receiver, eph_r_pk, hs, ck, key_init) = state;
 
         msg.f_type.set(TYPE_RESPONSE as u32);
         msg.f_sender.set(local); // from us
@@ -471,21 +633,25 @@ pub(super) fn create_response<R: RngCore + CryptoRng, O>(
         let (key_recv, key_send) = KDF2!(&ck, &[]);
 
         // return unconfirmed key-pair
+        let key = get_key(&endpoint)?;
+
+        msg.f_id = key.id.into();
 
         Ok(KeyPair {
             birth: Instant::now(),
             initiator: false,
             send: Key {
                 id: receiver,
-                key: key_send.into(),
+                key: key.key.into(),
             },
             recv: Key {
                 id: local,
-                key: key_recv.into(),
+                key: key_init.into(),
             },
         })
     })
 }
+
 
 /* The state lock is released while processing the message to
  * allow concurrent processing of potential responses to the initiation,
@@ -495,19 +661,21 @@ pub(super) fn consume_response<'a, O>(
     device: &'a Device<O>,
     keyst: &KeyState,
     msg: &NoiseResponse,
+    endpoint: &EndpointETSI,
 ) -> Result<Output<'a, O>, HandshakeError> {
     log::debug!("consume response");
     clear_stack_on_return_fnonce(CLEAR_PAGES, || {
         // retrieve peer and copy initiation state
         let (peer, _) = device.lookup_id(msg.f_receiver.get())?;
 
-        let (hs, ck, local, eph_sk) = match *peer.state.lock() {
+        let (hs, ck, local, eph_sk, key_init) = match *peer.state.lock() {
             State::InitiationSent {
                 hs,
                 ck,
                 local,
                 ref eph_sk,
-            } => Ok((hs, ck, local, StaticSecret::from(eph_sk.to_bytes()))),
+                key
+            } => Ok((hs, ck, local, StaticSecret::from(eph_sk.to_bytes()), key)),
             _ => Err(HandshakeError::InvalidState),
         }?;
 
@@ -560,6 +728,8 @@ pub(super) fn consume_response<'a, O>(
             _ => false,
         };
 
+        let key = get_key_id(&endpoint, msg.f_id)?;
+
         if update {
             // null the initiation state
             // (to avoid replay of this response message)
@@ -575,11 +745,11 @@ pub(super) fn consume_response<'a, O>(
                     initiator: true,
                     send: Key {
                         id: remote,
-                        key: key_send.into(),
+                        key: key_init.into(),
                     },
                     recv: Key {
                         id: local,
-                        key: key_recv.into(),
+                        key: key.key.into(),
                     },
                 }),
             ))

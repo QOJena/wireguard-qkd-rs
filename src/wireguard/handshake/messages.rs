@@ -19,6 +19,9 @@ const SIZE_COOKIE: usize = 16; //
 const SIZE_X25519_POINT: usize = 32; // x25519 public key
 const SIZE_TIMESTAMP: usize = 12;
 
+const SIZE_UUID: usize = 16;
+const SIZE_KEY: usize = 32;
+
 pub const TYPE_INITIATION: u32 = 1;
 pub const TYPE_RESPONSE: u32 = 2;
 pub const TYPE_COOKIE_REPLY: u32 = 3;
@@ -75,6 +78,7 @@ pub struct NoiseInitiation {
     pub f_ephemeral: [u8; SIZE_X25519_POINT],
     pub f_static: [u8; SIZE_X25519_POINT + SIZE_TAG],
     pub f_timestamp: [u8; SIZE_TIMESTAMP + SIZE_TAG],
+    pub f_id: [u8; SIZE_UUID],
 }
 
 #[repr(packed)]
@@ -85,6 +89,7 @@ pub struct NoiseResponse {
     pub f_receiver: U32<LittleEndian>,
     pub f_ephemeral: [u8; SIZE_X25519_POINT],
     pub f_empty: [u8; SIZE_TAG],
+    pub f_id: [u8; SIZE_UUID]
 }
 
 /* Zero copy parsing of handshake messages */
@@ -176,6 +181,7 @@ impl Default for NoiseInitiation {
             f_ephemeral: [0u8; SIZE_X25519_POINT],
             f_static: [0u8; SIZE_X25519_POINT + SIZE_TAG],
             f_timestamp: [0u8; SIZE_TIMESTAMP + SIZE_TAG],
+            f_id: [0u8; SIZE_UUID],
         }
     }
 }
@@ -188,6 +194,7 @@ impl Default for NoiseResponse {
             f_receiver: <U32<LittleEndian>>::ZERO,
             f_ephemeral: [0u8; SIZE_X25519_POINT],
             f_empty: [0u8; SIZE_TAG],
+            f_id: [0u8; SIZE_UUID]
         }
     }
 }
